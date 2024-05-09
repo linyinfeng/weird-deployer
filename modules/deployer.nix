@@ -293,10 +293,66 @@ in
     {
       build.deployer = pkgs.writeShellApplication {
         name = "deployer";
-        runtimeInputs = [ config.build.monitor ];
+        runtimeInputs = [ config.build.monitor ] ++ (with pkgs; [ getopt ]);
         text = ''
+          # cmdline argument parsing
+          # https://stackoverflow.com/a/29754866/7362315
+
+          LONGOPTS=include:,exclude:
+          OPTIONS=i:e:
+
+          PARSED=$(getopt --options="$OPTIONS" --longoptions="$LONGOPTS" --name "$0" -- "$@") || exit 1
+          eval set -- "$PARSED"
+
+          include_regex=".*"
+          exclude_regex=""
+          while true; do
+            case "$1" in
+              -i|--include)
+                include_regex="$2"
+                shift 2
+                ;;
+              -e|--exclude)
+                exclude_regex="$2"
+                shift 2
+                ;;
+              --)
+                shift
+                break
+                ;;
+              *)
+                echo "unexpected parameter: $1"
+                exit 1
+                ;;
+            esac
+          done
+          if [[ $# -ne 0 ]]; then
+              echo "unexpected parameters: $*"
+              exit 1
+          fi
+
+          # filter units
+
+          units="$(mktemp -t --directory "weird-deployer-units-XXXXXX")"
+          install -m644 "${config.build.generatedUnits}/"* "$units/"
+          pushd "$units" >/dev/null
+          for host_file in "${cfg.unitPrefix}"-*@*.service; do
+            [[ "$host_file" =~ ^.*@(.+)\.service$ ]]
+            host="''${BASH_REMATCH[1]}"
+            if [[ ! "$host" =~ ^$include_regex$ ]] || [[ "$host" =~ ^$exclude_regex$ ]]; then
+              # mask file
+              ln --symbolic --force /dev/null "$host_file"
+            fi
+          done
+          popd >/dev/null
+
+          # install and  start units
+
           mkdir --parents "${cfg.unitsDirectory}"
-          install -m644 "${config.build.generatedUnits}/"* "${cfg.unitsDirectory}/"
+          cp --recursive --no-dereference --remove-destination \
+            "$units/"* "${cfg.unitsDirectory}/"
+          rm --recursive "$units"
+
           systemctl --user daemon-reload
           systemctl --user reset-failed "${cfg.unitPrefix}*"
 
