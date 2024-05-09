@@ -345,7 +345,7 @@ in
           # install and  start units
 
           mkdir --parents "${cfg.unitsDirectory}"
-          rm --recursive "${cfg.unitsDirectory}/${cfg.unitPrefix}"*
+          rm --recursive --force "${cfg.unitsDirectory}/${cfg.unitPrefix}"*
           cp --recursive --no-dereference "$units/"* "${cfg.unitsDirectory}/"
           rm --recursive "$units"
 
@@ -360,15 +360,21 @@ in
             systemctl --user stop "${cfg.unitPrefix}*"
           }
           trap stop_all EXIT
+          monitor_session="$(WEIRD_DEPLOYER_MONITOR_NO_ATTACH=1 monitor)"
+          sleep 0.5 # wait journalctl spawn
           systemctl --user start "${cfg.unitPrefix}-deployed.target" --no-block
-          monitor
+          tmux attach-session -t "$monitor_session"
         '';
       };
 
       build.clean = pkgs.writeShellApplication {
         name = "clean";
         text = ''
-          rm -v "${cfg.unitsDirectory}/${cfg.unitPrefix}"*
+          set -x
+          systemctl --user stop "${cfg.unitPrefix}*"
+          systemctl --user reset-failed "${cfg.unitPrefix}*"
+          rm --recursive "${cfg.unitsDirectory}/${cfg.unitPrefix}"*
+          systemctl --user daemon-reload
         '';
       };
 
@@ -391,7 +397,10 @@ in
                 "${cfg.unitPrefix}*"'
           window=0
           tmux split-window -t "$session:$window" -v -l 50% -d \
-            'journalctl --user --unit "${cfg.unitPrefix}*" --no-hostname --follow'
+            'journalctl --user --unit "${cfg.unitPrefix}*" --no-hostname --follow --lines 0'
+          tmux split-window -t "$session:$window.{bottom}" -h -l 30% -d \
+            'journalctl --user --unit "${cfg.unitPrefix}*" --no-hostname --follow --lines 0 \
+               --identifier systemd --output=cat'
           tmux split-window -t "$session:$window" -h -l 30% -d \
             'SYSTEMD_COLORS=true viddy --interval "${monitorCfg.interval}" \
               systemctl --user list-jobs "${cfg.unitPrefix}*"'
@@ -402,6 +411,11 @@ in
           done
 
           tmux set-option -t "$session" mouse on
+
+          if [ "$WEIRD_DEPLOYER_MONITOR_NO_ATTACH" = "1" ]; then
+            echo "$session"
+            exit
+          fi
 
           tmux attach-session -t "$session"
         '';
