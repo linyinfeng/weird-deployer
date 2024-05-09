@@ -91,6 +91,7 @@ let
     {
       "${cfg.unitPrefix}-evaluate@${escapedName}" = recursiveUpdate common {
         description = "Evaluate %I";
+        requiredBy = [ "${cfg.unitPrefix}-evaluated.target" ];
         serviceConfig = {
           SyslogIdentifier = "wd-evaluate-${hostCfg.name}";
         };
@@ -104,6 +105,7 @@ let
 
       "${cfg.unitPrefix}-build@${escapedName}" = recursiveUpdate common rec {
         description = "Build %I";
+        requiredBy = [ "${cfg.unitPrefix}-built.target" ];
         requires = [
           "${cfg.unitPrefix}-evaluate@${escapedName}.service"
         ] ++ optional cfg.syncOn.evaluated "${cfg.unitPrefix}-evaluated.target";
@@ -125,6 +127,7 @@ let
 
       "${cfg.unitPrefix}-copy@${escapedName}" = recursiveUpdate common rec {
         description = "Copy to %I";
+        requiredBy = [ "${cfg.unitPrefix}-copied.target" ];
         requires = [
           "${cfg.unitPrefix}-build@${escapedName}.service"
         ] ++ optional cfg.syncOn.built "${cfg.unitPrefix}-built.target";
@@ -142,6 +145,7 @@ let
 
       "${cfg.unitPrefix}-test@${escapedName}" = recursiveUpdate common rec {
         description = "Test %I";
+        requiredBy = [ "${cfg.unitPrefix}-tested.target" ];
         requires = [
           "${cfg.unitPrefix}-copy@${escapedName}.service"
         ] ++ optional cfg.syncOn.copied "${cfg.unitPrefix}-copied.target";
@@ -161,6 +165,7 @@ let
 
       "${cfg.unitPrefix}-deploy@${escapedName}" = recursiveUpdate common rec {
         description = "Deploy %I";
+        requiredBy = [ "${cfg.unitPrefix}-deployed.target" ];
         requires = [
           "${cfg.unitPrefix}-test@${escapedName}.service"
         ] ++ optional cfg.syncOn.tested "${cfg.unitPrefix}-tested.target";
@@ -188,8 +193,8 @@ in
       syncMode =
         let
           type = types.enum [
-            "requires"
-            "wants"
+            "requiredBy"
+            "wantedBy"
           ];
           syncModeOpt = lib.mkOption {
             inherit type;
@@ -199,7 +204,7 @@ in
         {
           default = lib.mkOption {
             inherit type;
-            default = "requires";
+            default = "requiredBy";
           };
           evaluated = syncModeOpt;
           built = syncModeOpt;
@@ -250,22 +255,7 @@ in
   };
 
   config = lib.mkMerge [
-    (
-      let
-        hostServices =
-          action: mapAttrsToList (name: _: "${cfg.unitPrefix}-${action}@${name}.service") cfg.hosts;
-      in
-      {
-        systemd.targets = {
-          "${cfg.unitPrefix}-evaluated".${cfg.syncMode.evaluated} = hostServices "evaluate";
-          "${cfg.unitPrefix}-built".${cfg.syncMode.built} = hostServices "build";
-          "${cfg.unitPrefix}-copied".${cfg.syncMode.copied} = hostServices "copy";
-          "${cfg.unitPrefix}-tested".${cfg.syncMode.tested} = hostServices "test";
-          "${cfg.unitPrefix}-deployed".${cfg.syncMode.deployed} = hostServices "deploy";
-        };
-        systemd.services = fold recursiveUpdate { } (mapAttrsToList (_: makeHostServices) cfg.hosts);
-      }
-    )
+    { systemd.services = fold recursiveUpdate { } (mapAttrsToList (_: makeHostServices) cfg.hosts); }
 
     (
       let
@@ -298,7 +288,7 @@ in
           # cmdline argument parsing
           # https://stackoverflow.com/a/29754866/7362315
 
-          LONGOPTS=include:,exclude:
+          LONGOPTS=include:,exclude:,install-only
           OPTIONS=i:e:
 
           PARSED=$(getopt --options="$OPTIONS" --longoptions="$LONGOPTS" --name "$0" -- "$@") || exit 1
@@ -306,6 +296,7 @@ in
 
           include_regex=".*"
           exclude_regex=""
+          install_only=""
           while true; do
             case "$1" in
               -i|--include)
@@ -315,6 +306,10 @@ in
               -e|--exclude)
                 exclude_regex="$2"
                 shift 2
+                ;;
+              --install-only)
+                install_only=1
+                shift
                 ;;
               --)
                 shift
@@ -334,7 +329,8 @@ in
           # filter units
 
           units="$(mktemp -t --directory "weird-deployer-units-XXXXXX")"
-          install -m644 "${config.build.generatedUnits}/"* "$units/"
+          cp --recursive --no-dereference "${config.build.generatedUnits}/"* "$units/"
+          chmod --recursive u+w "$units"
           pushd "$units" >/dev/null
           for host_file in "${cfg.unitPrefix}"-*@*.service; do
             [[ "$host_file" =~ ^.*@(.+)\.service$ ]]
@@ -349,12 +345,16 @@ in
           # install and  start units
 
           mkdir --parents "${cfg.unitsDirectory}"
-          cp --recursive --no-dereference --remove-destination \
-            "$units/"* "${cfg.unitsDirectory}/"
+          rm --recursive "${cfg.unitsDirectory}/${cfg.unitPrefix}"*
+          cp --recursive --no-dereference "$units/"* "${cfg.unitsDirectory}/"
           rm --recursive "$units"
 
           systemctl --user daemon-reload
           systemctl --user reset-failed "${cfg.unitPrefix}*"
+
+          if [ "$install_only" = "1" ]; then
+            exit
+          fi
 
           function stop_all {
             systemctl --user stop "${cfg.unitPrefix}*"
