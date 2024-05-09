@@ -360,10 +360,9 @@ in
             systemctl --user stop "${cfg.unitPrefix}*"
           }
           trap stop_all EXIT
-          monitor_session="$(WEIRD_DEPLOYER_MONITOR_NO_ATTACH=1 monitor)"
-          sleep 0.5 # wait journalctl spawn
+          before_start="$(date --iso-8601=seconds)"
           systemctl --user start "${cfg.unitPrefix}-deployed.target" --no-block
-          tmux attach-session -t "$monitor_session"
+          WEIRD_DEPLOYER_MONITOR_SINCE="$before_start" monitor
         '';
       };
 
@@ -389,6 +388,13 @@ in
 
           tmux kill-session -t "$session" 2>/dev/null || true
 
+          if [ -v WEIRD_DEPLOYER_MONITOR_SINCE ] &&
+             [ -n "$WEIRD_DEPLOYER_MONITOR_SINCE" ]; then
+            since="$WEIRD_DEPLOYER_MONITOR_SINCE"
+          else
+            since="$(date --iso-8601=seconds)"
+          fi
+
           tmux new-session -d -s "$session" \
             'SYSTEMD_COLORS=true viddy --interval "${monitorCfg.interval}" \
               systemctl \
@@ -397,10 +403,12 @@ in
                 "${cfg.unitPrefix}*"'
           window=0
           tmux split-window -t "$session:$window" -v -l 50% -d \
-            'journalctl --user --unit "${cfg.unitPrefix}*" --no-hostname --follow --lines 0'
+            'journalctl --user --unit "${cfg.unitPrefix}*" --no-hostname \
+               --follow --since '"'$since'"
           tmux split-window -t "$session:$window.{bottom}" -h -l 30% -d \
-            'journalctl --user --unit "${cfg.unitPrefix}*" --no-hostname --follow --lines 0 \
-               --identifier systemd --output=cat'
+            'journalctl --user --unit "${cfg.unitPrefix}*" --no-hostname \
+               --identifier systemd --output=cat \
+               --follow --since '"'$since'"
           tmux split-window -t "$session:$window" -h -l 30% -d \
             'SYSTEMD_COLORS=true viddy --interval "${monitorCfg.interval}" \
               systemctl --user list-jobs "${cfg.unitPrefix}*"'
@@ -412,7 +420,8 @@ in
 
           tmux set-option -t "$session" mouse on
 
-          if [ "$WEIRD_DEPLOYER_MONITOR_NO_ATTACH" = "1" ]; then
+          if [ -v WEIRD_DEPLOYER_MONITOR_NO_ATTACH ] &&
+             [ "$WEIRD_DEPLOYER_MONITOR_NO_ATTACH" = "1" ]; then
             echo "$session"
             exit
           fi
