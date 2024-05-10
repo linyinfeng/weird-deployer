@@ -26,8 +26,11 @@ let
   phases = [
     "evaluated"
     "built"
-    "tested"
     "copied"
+    "system-saved"
+    "tested"
+    "profile-saved"
+    "profile-updated"
     "deployed"
   ];
 
@@ -79,11 +82,12 @@ let
       escapedName = escapeSystemdPath hostCfg.name;
 
       prelude = pkgs.writeShellScript "prelude.sh" ''
-        toplevel_store_path="$(readlink toplevel)"
         function target_command {
           ssh "${hostCfg.ssh.user}@${hostCfg.ssh.host}" "$@"
         }
         function target_switch_to_configuration {
+          toplevel="$1"
+          shift
           target_command \
             systemd-run \
               --setenv=LOCALE_ARCHIVE \
@@ -94,7 +98,7 @@ let
               --service-type=exec \
               --unit=nixos-rebuild-switch-to-configuration \
               --wait \
-              "$toplevel_store_path/bin/switch-to-configuration" \
+              "$toplevel/bin/switch-to-configuration" \
               "$@"
         }
       '';
@@ -153,12 +157,28 @@ let
         '';
       };
 
+      "${cfg.unitPrefix}-system-save@${escapedName}" = recursiveUpdate serviceCommon {
+        description = "System save %I";
+        requiredBy = [ "${cfg.unitPrefix}-system-saved.target" ];
+        serviceConfig = {
+          SyslogIdentifier = "wd-system-save-${hostCfg.name}";
+        };
+        script = ''
+          source "${prelude}"
+          target_command readlink /run/current-system >old-current-system
+        '';
+      };
+
       "${cfg.unitPrefix}-test@${escapedName}" = recursiveUpdate serviceCommon rec {
         description = "Test %I";
         requiredBy = [ "${cfg.unitPrefix}-tested.target" ];
-        requires = [
-          "${cfg.unitPrefix}-copy@${escapedName}.service"
-        ] ++ optional cfg.syncOn.copied "${cfg.unitPrefix}-copied.target";
+        requires =
+          [
+            "${cfg.unitPrefix}-copy@${escapedName}.service"
+            "${cfg.unitPrefix}-system-save@${escapedName}.service"
+          ]
+          ++ optional cfg.syncOn.copied "${cfg.unitPrefix}-copied.target"
+          ++ optional cfg.syncOn.system-saved "${cfg.unitPrefix}-system-saved.target";
         after = requires;
         unitConfig = {
           JoinsNamespaceOf = [ "${cfg.unitPrefix}-build@${escapedName}.service" ];
@@ -168,28 +188,141 @@ let
         };
         script = ''
           source "${prelude}"
-          target_switch_to_configuration test
+          target_switch_to_configuration "$(readlink toplevel)" test
         '';
       };
 
-      "${cfg.unitPrefix}-deploy@${escapedName}" = recursiveUpdate serviceCommon rec {
-        description = "Deploy %I";
-        requiredBy = [ "${cfg.unitPrefix}-deployed.target" ];
-        requires = [
-          "${cfg.unitPrefix}-test@${escapedName}.service"
-        ] ++ optional cfg.syncOn.tested "${cfg.unitPrefix}-tested.target";
+      "${cfg.unitPrefix}-test-rollback@${escapedName}" = recursiveUpdate serviceCommon {
+        description = "System rollback %I";
+        requiredBy = [ "${cfg.unitPrefix}-rollbacked@${escapedName}.target" ];
+        conflicts = [ "${cfg.unitPrefix}-test@${escapedName}.service" ];
+        unitConfig = {
+          JoinsNamespaceOf = [ "${cfg.unitPrefix}-system-save@${escapedName}.service" ];
+        };
+        serviceConfig = {
+          SyslogIdentifier = "wd-test-rollback-${hostCfg.name}";
+        };
+        script = ''
+          if [ -f old-current-system ]; then
+            source "${prelude}"
+            target_switch_to_configuration "$(cat old-current-system)" test
+          else
+            echo "no need to rollback"
+          fi
+        '';
+      };
+
+      "${cfg.unitPrefix}-profile-save@${escapedName}" = recursiveUpdate serviceCommon {
+        description = "Profile save %I";
+        requiredBy = [ "${cfg.unitPrefix}-profile-saved.target" ];
+        serviceConfig = {
+          SyslogIdentifier = "wd-profile-save-${hostCfg.name}";
+        };
+        script = ''
+          source "${prelude}"
+          target_command readlink /nix/var/nix/profiles/system >old-system-profile
+        '';
+      };
+
+      "${cfg.unitPrefix}-profile-update@${escapedName}" = recursiveUpdate serviceCommon rec {
+        description = "Profile update %I";
+        requiredBy = [ "${cfg.unitPrefix}-profile-updated.target" ];
+        requires =
+          [
+            "${cfg.unitPrefix}-test@${escapedName}.service"
+            "${cfg.unitPrefix}-profile-save@${escapedName}.service"
+          ]
+          ++ optional cfg.syncOn.tested "${cfg.unitPrefix}-tested.target"
+          ++ optional cfg.syncOn.profile-saved "${cfg.unitPrefix}-profile-saved.target";
         after = requires;
         unitConfig = {
           JoinsNamespaceOf = [ "${cfg.unitPrefix}-build@${escapedName}.service" ];
         };
         serviceConfig = {
+          SyslogIdentifier = "wd-profile-update-${hostCfg.name}";
+        };
+        script = ''
+          source "${prelude}"
+          target_command nix-env --profile /nix/var/nix/profiles/system --set "$(readlink toplevel)"
+        '';
+      };
+
+      "${cfg.unitPrefix}-profile-rollback@${escapedName}" = recursiveUpdate serviceCommon {
+        description = "Profile rollback %I";
+        requiredBy = [ "${cfg.unitPrefix}-rollbacked@${escapedName}.target" ];
+        conflicts = [ "${cfg.unitPrefix}-profile-update@${escapedName}.service" ];
+        unitConfig = {
+          JoinsNamespaceOf = [ "${cfg.unitPrefix}-profile-save@${escapedName}.service" ];
+        };
+        serviceConfig = {
+          SyslogIdentifier = "wd-profile-rollback-${hostCfg.name}";
+        };
+        script = ''
+          if [ -f old-system-profile ]; then
+            source "${prelude}"
+            target_command ln --symbolic --force --no-dereference --verbose \
+              "$(cat old-system-profile)" /nix/var/nix/profiles/system
+          else
+            echo "no need to rollback"
+          fi
+        '';
+      };
+
+      "${cfg.unitPrefix}-deploy@${escapedName}" = recursiveUpdate serviceCommon rec {
+        description = "Deploy %I";
+        requiredBy = [ "${cfg.unitPrefix}-deployed@${escapedName}.target" ];
+        requires = [
+          "${cfg.unitPrefix}-profile-update@${escapedName}.service"
+        ] ++ optional cfg.syncOn.profile-updated "${cfg.unitPrefix}-profile-updated.target";
+        after = requires;
+        serviceConfig = {
           SyslogIdentifier = "wd-deploy-${hostCfg.name}";
         };
         script = ''
           source "${prelude}"
-          target_command nix-env --profile /nix/var/nix/profiles/system --set "$toplevel_store_path"
-          target_switch_to_configuration boot
+          target_switch_to_configuration /run/current-system boot
         '';
+      };
+
+      "${cfg.unitPrefix}-deploy-rollback@${escapedName}" = recursiveUpdate serviceCommon rec {
+        description = "Deploy rollback %I";
+        requiredBy = [ "${cfg.unitPrefix}-rollbacked@${escapedName}.target" ];
+        requires = [
+          "${cfg.unitPrefix}-test-rollback@${escapedName}.service"
+          "${cfg.unitPrefix}-profile-rollback@${escapedName}.service"
+        ];
+        after = requires;
+        unitConfig = {
+          JoinsNamespaceOf = [ "${cfg.unitPrefix}-profile-save@${escapedName}.service" ];
+        };
+        serviceConfig = {
+          SyslogIdentifier = "wd-deploy-rollback-${hostCfg.name}";
+        };
+        script = ''
+          if [ -f old-system-profile ]; then
+            source "${prelude}"
+            target_switch_to_configuration /run/current-system boot
+          else
+            echo "no need to rollback"
+          fi
+        '';
+      };
+    };
+
+  makeHostTargets =
+    unitCommon: hostCfg:
+    let
+      escapedName = escapeSystemdPath hostCfg.name;
+    in
+    {
+      "${cfg.unitPrefix}-rollbacked@${escapedName}" = {
+        description = "Host %I rollbacked";
+        conflicts = [ "${cfg.unitPrefix}-deployed@${escapedName}.target" ];
+      };
+      "${cfg.unitPrefix}-deployed@${escapedName}" = {
+        description = "Host %I deployed";
+        requiredBy = [ "${cfg.unitPrefix}-deployed.target" ];
+        onFailure = lib.mkIf cfg.autoRollback [ "${cfg.unitPrefix}-rollbacked@${escapedName}.target" ];
       };
     };
 in
@@ -235,6 +368,11 @@ in
           };
         }
         // listToAttrs (map (p: nameValuePair p syncOnOpt) phases);
+      autoRollback = mkOption {
+        type = types.bool;
+        default = true;
+      };
+
       packages = {
         nix = mkOption {
           type = types.package;
@@ -246,11 +384,6 @@ in
         type = types.str;
         default = "$XDG_RUNTIME_DIR/systemd/user";
       };
-      stopWhenUnneeded = mkOption {
-        type = types.bool;
-        default = false;
-      };
-
       unitPrefix = mkOption {
         type = types.str;
         default = "wd-${cfg.identifier}";
@@ -268,24 +401,24 @@ in
     (
       let
         common = {
-          unitConfig = {
-            StopWhenUnneeded = cfg.stopWhenUnneeded;
-          };
+          # nothing
         };
       in
       {
         systemd.services = fold recursiveUpdate { } (mapAttrsToList (_: makeHostServices common) cfg.hosts);
-        systemd.targets = listToAttrs (
-          map (
-            phase:
-            nameValuePair "${cfg.unitPrefix}-${phase}" (
-              recursiveUpdate common {
-                description = "All Hosts ${phase}";
-                aliases = mkIf (phase == cfg.phase) [ "${cfg.unitPrefix}.target" ];
-              }
-            )
-          ) phases
-        );
+        systemd.targets =
+          fold recursiveUpdate { } (mapAttrsToList (_: makeHostTargets common) cfg.hosts)
+          // listToAttrs (
+            map (
+              phase:
+              nameValuePair "${cfg.unitPrefix}-${phase}" (
+                recursiveUpdate common {
+                  description = "All Hosts ${phase}";
+                  aliases = mkIf (phase == cfg.phase) [ "${cfg.unitPrefix}.target" ];
+                }
+              )
+            ) phases
+          );
         systemd.slices."${cfg.unitPrefix}" = recursiveUpdate common {
           description = "Slice deplyer ${cfg.identifier}";
         };
@@ -481,12 +614,13 @@ in
             cp --recursive --no-dereference "${config.build.generatedUnits}/"* "$units/"
             chmod --recursive u+w "$units"
             pushd "$units" >/dev/null
-            for host_file in "${cfg.unitPrefix}"-*@*.service; do
-              [[ "$host_file" =~ ^.*@(.+)\.service$ ]]
-              host="''${BASH_REMATCH[1]}"
-              if [[ ! "$host" =~ ^$include_regex$ ]] || [[ "$host" =~ ^$exclude_regex$ ]]; then
-                # mask file
-                ln --symbolic --force /dev/null "$host_file"
+            for host_file in *; do
+              if [[ "$host_file" =~ ^.*@(.+)\.(service|target)$ ]]; then
+                host="''${BASH_REMATCH[1]}"
+                if [[ ! "$host" =~ ^$include_regex$ ]] || [[ "$host" =~ ^$exclude_regex$ ]]; then
+                  # mask file
+                  ln --symbolic --force /dev/null "$host_file"
+                fi
               fi
             done
             popd >/dev/null
@@ -529,7 +663,6 @@ in
                 'SYSTEMD_COLORS=true viddy --interval "${monitorCfg.interval}" \
                   systemctl \
                     --user list-units \
-                    --state=activating --state=failed \
                     "${cfg.unitPrefix}*"'
               window=0
               tmux split-window -t "$session:$window" -v -l 50% -d \
