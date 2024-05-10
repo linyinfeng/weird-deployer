@@ -433,64 +433,36 @@ in
       {
         build.deployer = pkgs.writeShellApplication {
           name = "weird-deployer";
-          runtimeInputs =
-            (with config.build; [
+          runtimeInputs = (
+            with config.build;
+            [
               prepare
               monitor
-            ])
-            ++ (with pkgs; [ getopt ]);
+            ]
+          );
           text = ''
-            # cmdline argument parsing
-            # https://stackoverflow.com/a/29754866/7362315
-
-            LONGOPTS="no-stop,no-prepare,no-monitor,${prepareLongOpts}"
-            OPTIONS="${prepareShortOpts}"
-
-            PARSED=$(getopt --options="$OPTIONS" --longoptions="$LONGOPTS" --name "$0" -- "$@") || exit 1
-            eval set -- "$PARSED"
-
+            args=("$@")
             action=""
-            no_stop=""
-            no_prepare=""
-            no_monitor=""
-            prepare_args=()
-            extra_args=()
-            while true; do
-              case "$1" in
-                --no-stop)
-                  no_stop="1"
-                  shift
-                  ;;
-                --no-prepare)
-                  no_prepare="1"
-                  shift
-                  ;;
-                --no-monitor)
-                  no_monitor="1"
-                  shift
-                  ;;
-                --)
-                  shift
-                  break
-                  ;;
-                *)
-                  prepare_args+=("$1")
-                  shift
-                  ;;
-              esac
-            done
-
-            if [[ $# -ge 1 ]]; then
+            if [[ "$#" -ge 1 ]]; then
               action="$1"
-              shift
+              action_args=("''${args[@]:1}")
             fi
-            extra_args=("$@")
 
             function wd_prepare {
-              wd-prepare "''${prepare_args[@]}" -- "$@"
+              wd-prepare "$@"
             }
             function wd_start {
               systemctl --user start "${cfg.unitPrefix}.target" "$@"
+            }
+            function wd_deploy {
+              host="$1"
+              shift
+              systemctl --user start "${cfg.unitPrefix}-deployed@$host.target" "$@"
+            }
+            function wd_rollback {
+              host="$1"
+              shift
+              systemctl --user start "${cfg.unitPrefix}-rollbacked@$host.target" "$@"
             }
             function wd_list_units {
               systemctl --user list-units "${cfg.unitPrefix}*" "$@"
@@ -511,59 +483,83 @@ in
             function wd_monitor {
               wd-monitor "$@"
             }
+            function wd {
+              no_stop=""
+              no_prepare=""
+              no_monitor=""
+              extra_args=()
+              while [ "$#" -ge 1 ]; do
+                case "$1" in
+                  --no-stop)
+                    no_stop="1"
+                    shift
+                    ;;
+                  --no-prepare)
+                    no_prepare="1"
+                    shift
+                    ;;
+                  --no-monitor)
+                    no_monitor="1"
+                    shift
+                    ;;
+                  *)
+                    extra_args+=("$1")
+                    shift
+                    ;;
+                esac
+              done
+
+              if [ "$no_prepare" != "1" ]; then
+                wd_prepare "''${extra_args[@]}"
+              fi
+              if [ "$no_stop" != "1" ]; then
+                trap wd_stop EXIT
+              fi
+
+              before_start="$(date --iso-8601=seconds)"
+              wd_start --no-block
+              if [ "$no_monitor" != "1" ]; then
+                WEIRD_DEPLOYER_MONITOR_SINCE="$before_start" wd_monitor
+              fi
+            }
 
             # parse done
-            if [ -n "$action" ]; then
-              case "$action" in
-                prepare)
-                  wd_prepare "''${extra_args[@]}"
-                  ;;
-                start)
-                  wd_start "''${extra_args[@]}"
-                  ;;
-                status|list-units)
-                  wd_list_units "''${extra_args[@]}"
-                  ;;
-                list-unit-files)
-                  wd_list_unit_files "''${extra_args[@]}"
-                  ;;
-                stop)
-                  wd_stop "''${extra_args[@]}"
-                  ;;
-                clean)
-                  wd_clean "''${extra_args[@]}"
-                  ;;
-                monitor)
-                  wd_monitor "''${extra_args[@]}"
-                  ;;
-                monitor-attach)
-                  WEIRD_DEPLOYER_MONITOR_ATTACH_ONLY=1 wd_monitor "''${extra_args[@]}"
-                  ;;
-                *)
-                  echo "unexpected action: $action"
-                  exit 1
-                  ;;
-              esac
-              exit
-            fi
-
-            if [[ "''${#extra_args[@]}" != 0 ]]; then
-              echo "unexpected parameters: ''${extra_args[*]}"
-              exit 1
-            fi
-
-            if [ "$no_prepare" != "1" ]; then
-              wd_prepare
-            fi
-            if [ "$no_stop" != "1" ]; then
-              trap wd_stop EXIT
-            fi
-
-            before_start="$(date --iso-8601=seconds)"
-            wd_start --no-block
-            if [ "$no_monitor" != "1" ]; then
-              WEIRD_DEPLOYER_MONITOR_SINCE="$before_start" wd_monitor
-            fi
+            case "$action" in
+              prepare)
+                wd_prepare "''${action_args[@]}"
+                ;;
+              start)
+                wd_start "''${action_args[@]}"
+                ;;
+              deploy)
+                wd_deploy "''${action_args[@]}"
+                ;;
+              rollback)
+                wd_rollback "''${action_args[@]}"
+                ;;
+              status|list-units)
+                wd_list_units "''${action_args[@]}"
+                ;;
+              list-unit-files)
+                wd_list_unit_files "''${action_args[@]}"
+                ;;
+              stop)
+                wd_stop "''${action_args[@]}"
+                ;;
+              clean)
+                wd_clean "''${action_args[@]}"
+                ;;
+              monitor)
+                wd_monitor "''${action_args[@]}"
+                ;;
+              monitor-attach)
+                WEIRD_DEPLOYER_MONITOR_ATTACH_ONLY=1 wd_monitor "''${action_args[@]}"
+                ;;
+              *)
+                # default action
+                wd "$@"
+                ;;
+            esac
           '';
         };
 
@@ -604,10 +600,6 @@ in
                 exit 1
             fi
 
-            # clean before prepare
-
-            rm --recursive --force "${cfg.unitsDirectory}/${cfg.unitPrefix}"*
-
             # filter units
 
             units="$(mktemp -t --directory "weird-deployer-units-XXXXXX")"
@@ -625,7 +617,7 @@ in
             done
             popd >/dev/null
 
-            # install and  start units
+            # install and start units
 
             mkdir --parents "${cfg.unitsDirectory}"
             rm --recursive --force "${cfg.unitsDirectory}/${cfg.unitPrefix}"*
