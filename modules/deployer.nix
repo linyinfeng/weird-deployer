@@ -451,7 +451,7 @@ in
             function wd_prepare {
               wd-prepare "$@"
             }
-            function wd_start {
+            function wd_deploy_all {
               systemctl --user start "${cfg.unitPrefix}.target" "$@"
             }
             function wd_deploy {
@@ -470,13 +470,16 @@ in
             function wd_list_unit_files {
               systemctl --user list-unit-files "${cfg.unitPrefix}*" "$@"
             }
-            function wd_stop {
+            function wd_stop_all {
               systemctl --user stop "${cfg.unitPrefix}*" "$@"
             }
+            function wd_reset_failed_all {
+              systemctl --user reset-failed "${cfg.unitPrefix}*" "$@"
+            }
             function wd_clean {
-              wd_stop "$@"
+              wd_stop_all
+              wd_reset_failed_all
 
-              systemctl --user reset-failed "${cfg.unitPrefix}*"
               rm --recursive --force "${cfg.unitsDirectory}/${cfg.unitPrefix}"*
               systemctl --user daemon-reload
             }
@@ -513,12 +516,14 @@ in
                 wd_prepare "''${extra_args[@]}"
               fi
               if [ "$no_stop" != "1" ]; then
-                trap wd_stop EXIT
+                trap wd_stop_all EXIT
               fi
 
               before_start="$(date --iso-8601=seconds)"
-              wd_start --no-block
-              if [ "$no_monitor" != "1" ]; then
+              if [ "$no_monitor" = "1" ]; then
+                wd_deploy_all
+              else
+                wd_deploy_all --no-block
                 WEIRD_DEPLOYER_MONITOR_SINCE="$before_start" wd_monitor
               fi
             }
@@ -528,8 +533,8 @@ in
               prepare)
                 wd_prepare "''${action_args[@]}"
                 ;;
-              start)
-                wd_start "''${action_args[@]}"
+              deploy-all)
+                wd_deploy_all "''${action_args[@]}"
                 ;;
               deploy)
                 wd_deploy "''${action_args[@]}"
@@ -543,8 +548,11 @@ in
               list-unit-files)
                 wd_list_unit_files "''${action_args[@]}"
                 ;;
-              stop)
-                wd_stop "''${action_args[@]}"
+              stop-all)
+                wd_stop_all "''${action_args[@]}"
+                ;;
+              reset-failed-all)
+                wd_reset_failed_all "''${action_args[@]}"
                 ;;
               clean)
                 wd_clean "''${action_args[@]}"
@@ -620,12 +628,27 @@ in
             # install and start units
 
             mkdir --parents "${cfg.unitsDirectory}"
+            pushd "$units" >/dev/null
+            units_changed=()
+            for unit in *; do
+              if [[ "$unit" =~ ^.*@(.+)\.(service|target)$ ]] &&
+                 [ -e "${cfg.unitsDirectory}/$unit" ] &&
+                 ! diff "$unit" "${cfg.unitsDirectory}/$unit" >/dev/null; then
+                units_changed+=("$unit")
+              fi
+            done
+            popd >/dev/null
             rm --recursive --force "${cfg.unitsDirectory}/${cfg.unitPrefix}"*
             cp --recursive --no-dereference "$units/"* "${cfg.unitsDirectory}/"
             rm --recursive "$units"
 
             systemctl --user daemon-reload
-            systemctl --user reset-failed "${cfg.unitPrefix}*"
+            # stop units under new dependencies
+            for unit in "''${units_changed[@]}"; do
+              if systemctl --user is-active "$unit" >/dev/null; then
+                systemctl --user stop "$unit" --show-transaction
+              fi
+            done
           '';
         };
 
