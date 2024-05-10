@@ -7,34 +7,48 @@
 }:
 let
   inherit (lib)
+    mkOption
+    mkMerge
+    mkIf
     types
     mapAttrsToList
+    listToAttrs
+    nameValuePair
     recursiveUpdate
     fold
     optional
     ;
+  inherit (lib.lists) map;
   inherit (utils) escapeSystemdPath;
   cfg = config.deployer;
   monitorCfg = config.monitor;
+
+  phases = [
+    "evaluated"
+    "built"
+    "tested"
+    "copied"
+    "deployed"
+  ];
 
   hostOpts =
     { name, ... }:
     {
       options = {
-        name = lib.mkOption {
+        name = mkOption {
           type = types.str;
           default = name;
         };
-        attribute = lib.mkOption {
+        attribute = mkOption {
           type = types.str;
           default = name;
         };
         ssh = {
-          user = lib.mkOption {
+          user = mkOption {
             type = types.str;
             default = "root";
           };
-          host = lib.mkOption {
+          host = mkOption {
             type = types.str;
             default = name;
           };
@@ -43,9 +57,9 @@ let
     };
 
   makeHostServices =
-    hostCfg:
+    unitCommon: hostCfg:
     let
-      common = {
+      serviceCommon = unitCommon // {
         path =
           [ cfg.packages.nix ]
           ++ (with pkgs; [
@@ -53,9 +67,6 @@ let
             git
             openssh
           ]);
-        unitConfig = {
-          StopWhenUnneeded = true;
-        };
         serviceConfig = {
           Type = "oneshot";
           RemainAfterExit = true;
@@ -89,7 +100,7 @@ let
       '';
     in
     {
-      "${cfg.unitPrefix}-evaluate@${escapedName}" = recursiveUpdate common {
+      "${cfg.unitPrefix}-evaluate@${escapedName}" = recursiveUpdate serviceCommon {
         description = "Evaluate %I";
         requiredBy = [ "${cfg.unitPrefix}-evaluated.target" ];
         serviceConfig = {
@@ -103,7 +114,7 @@ let
         '';
       };
 
-      "${cfg.unitPrefix}-build@${escapedName}" = recursiveUpdate common rec {
+      "${cfg.unitPrefix}-build@${escapedName}" = recursiveUpdate serviceCommon rec {
         description = "Build %I";
         requiredBy = [ "${cfg.unitPrefix}-built.target" ];
         requires = [
@@ -125,7 +136,7 @@ let
         '';
       };
 
-      "${cfg.unitPrefix}-copy@${escapedName}" = recursiveUpdate common rec {
+      "${cfg.unitPrefix}-copy@${escapedName}" = recursiveUpdate serviceCommon rec {
         description = "Copy to %I";
         requiredBy = [ "${cfg.unitPrefix}-copied.target" ];
         requires = [
@@ -143,7 +154,7 @@ let
         '';
       };
 
-      "${cfg.unitPrefix}-test@${escapedName}" = recursiveUpdate common rec {
+      "${cfg.unitPrefix}-test@${escapedName}" = recursiveUpdate serviceCommon rec {
         description = "Test %I";
         requiredBy = [ "${cfg.unitPrefix}-tested.target" ];
         requires = [
@@ -163,7 +174,7 @@ let
         '';
       };
 
-      "${cfg.unitPrefix}-deploy@${escapedName}" = recursiveUpdate common rec {
+      "${cfg.unitPrefix}-deploy@${escapedName}" = recursiveUpdate serviceCommon rec {
         description = "Deploy %I";
         requiredBy = [ "${cfg.unitPrefix}-deployed.target" ];
         requires = [
@@ -187,76 +198,71 @@ in
 {
   options = {
     deployer = {
-      identifier = lib.mkOption { type = types.str; };
-      flake = lib.mkOption { type = types.str; };
-      hosts = lib.mkOption { type = with types; attrsOf (submodule hostOpts); };
+      identifier = mkOption { type = types.str; };
+      flake = mkOption { type = types.str; };
+      hosts = mkOption { type = with types; attrsOf (submodule hostOpts); };
+      phase = mkOption {
+        type = types.enum phases;
+        default = "deployed";
+      };
       syncMode =
         let
           type = types.enum [
             "requiredBy"
             "wantedBy"
           ];
-          syncModeOpt = lib.mkOption {
+          syncModeOpt = mkOption {
             inherit type;
             default = cfg.syncMode.default;
           };
         in
         {
-          default = lib.mkOption {
+          default = mkOption {
             inherit type;
             default = "requiredBy";
           };
-          evaluated = syncModeOpt;
-          built = syncModeOpt;
-          copied = syncModeOpt;
-          tested = syncModeOpt;
-          deployed = syncModeOpt;
-        };
+        }
+        // listToAttrs (map (p: nameValuePair p syncModeOpt) phases);
       syncOn =
         let
-          syncOnOpt = lib.mkOption {
+          syncOnOpt = mkOption {
             type = types.bool;
             default = cfg.syncOn.default;
           };
         in
         {
-          default = lib.mkOption {
+          default = mkOption {
             type = types.bool;
             default = true;
           };
-          evaluated = syncOnOpt;
-          built = syncOnOpt;
-          copied = syncOnOpt;
-          tested = syncOnOpt;
-        };
+        }
+        // listToAttrs (map (p: nameValuePair p syncOnOpt) phases);
       packages = {
-        nix = lib.mkOption {
+        nix = mkOption {
           type = types.package;
           default = pkgs.nix;
           defaultText = "pkgs.nix";
         };
       };
-      unitsDirectory = lib.mkOption {
+      unitsDirectory = mkOption {
         type = types.str;
         default = "$XDG_RUNTIME_DIR/systemd/user";
       };
 
-      unitPrefix = lib.mkOption {
+      unitPrefix = mkOption {
         type = types.str;
         default = "wd-${cfg.identifier}";
       };
     };
     monitor = {
-      interval = lib.mkOption {
+      interval = mkOption {
         type = types.str;
         default = "0.5";
       };
     };
   };
 
-  config = lib.mkMerge [
-    { systemd.services = fold recursiveUpdate { } (mapAttrsToList (_: makeHostServices) cfg.hosts); }
-
+  config = mkMerge [
     (
       let
         common = {
@@ -266,15 +272,19 @@ in
         };
       in
       {
-        # common units
-        systemd.targets = {
-          "${cfg.unitPrefix}-evaluated" = lib.recursiveUpdate common { description = "All Hosts Evaluated"; };
-          "${cfg.unitPrefix}-built" = lib.recursiveUpdate common { description = "All Hosts Built"; };
-          "${cfg.unitPrefix}-copied" = lib.recursiveUpdate common { description = "All Hosts Copied"; };
-          "${cfg.unitPrefix}-tested" = lib.recursiveUpdate common { description = "All Hosts Tested"; };
-          "${cfg.unitPrefix}-deployed" = lib.recursiveUpdate common { description = "All Hosts Deployed"; };
-        };
-        systemd.slices."${cfg.unitPrefix}" = lib.recursiveUpdate common {
+        systemd.services = fold recursiveUpdate { } (mapAttrsToList (_: makeHostServices common) cfg.hosts);
+        systemd.targets = listToAttrs (
+          map (
+            phase:
+            nameValuePair "${cfg.unitPrefix}-${phase}" (
+              recursiveUpdate common {
+                description = "All Hosts ${phase}";
+                aliases = mkIf (phase == cfg.phase) [ "${cfg.unitPrefix}.target" ];
+              }
+            )
+          ) phases
+        );
+        systemd.slices."${cfg.unitPrefix}" = recursiveUpdate common {
           description = "Slice deplyer ${cfg.identifier}";
         };
       }
@@ -361,7 +371,7 @@ in
           }
           trap stop_all EXIT
           before_start="$(date --iso-8601=seconds)"
-          systemctl --user start "${cfg.unitPrefix}-deployed.target" --no-block
+          systemctl --user start "${cfg.unitPrefix}.target" --no-block
           WEIRD_DEPLOYER_MONITOR_SINCE="$before_start" monitor
         '';
       };
@@ -382,6 +392,7 @@ in
         runtimeInputs = with pkgs; [
           tmux
           viddy
+          jq
         ];
         text = ''
           session="${cfg.unitPrefix}"
@@ -403,22 +414,27 @@ in
                 "${cfg.unitPrefix}*"'
           window=0
           tmux split-window -t "$session:$window" -v -l 50% -d \
-            'journalctl --user --unit "${cfg.unitPrefix}*" --no-hostname \
-               --follow --since '"'$since'"
+            "journalctl --user --unit '${cfg.unitPrefix}*' \
+               --follow --since '$since' --output=json | \
+               jq --raw-output '\"\(.SYSLOG_IDENTIFIER)> \(.MESSAGE)\"'"
           tmux split-window -t "$session:$window.{bottom}" -h -l 30% -d \
-            'journalctl --user --unit "${cfg.unitPrefix}*" --no-hostname \
-               --identifier systemd --output=cat \
-               --follow --since '"'$since'"
+            "journalctl --user --unit '${cfg.unitPrefix}*' \
+               --follow --since '$since' \
+               --identifier systemd --output=cat"
           tmux split-window -t "$session:$window" -h -l 30% -d \
             'SYSTEMD_COLORS=true viddy --interval "${monitorCfg.interval}" \
               systemctl --user list-jobs "${cfg.unitPrefix}*"'
           tmux rename-window -t "$session:$window" "monitor"
 
-          for key in "C-c" "q" "Escape"; do
-            tmux bind-key -T root "$key" kill-session -t "$session"
-          done
-
           tmux set-option -t "$session" mouse on
+
+          # run bind-key commands in the tmux session
+          window=1
+          tmux new-window -t "$session:1" bash -c "
+          for key in C-c q Escape; do
+            tmux bind-key -T root \"\$key\" kill-session -t '$session'
+          done
+          "
 
           if [ -v WEIRD_DEPLOYER_MONITOR_NO_ATTACH ] &&
              [ "$WEIRD_DEPLOYER_MONITOR_NO_ATTACH" = "1" ]; then
