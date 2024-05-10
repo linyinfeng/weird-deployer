@@ -529,6 +529,7 @@ in
                 'SYSTEMD_COLORS=true viddy --interval "${monitorCfg.interval}" \
                   systemctl \
                     --user list-units \
+                    --state=activating --state=failed \
                     "${cfg.unitPrefix}*"'
               window=0
               tmux split-window -t "$session:$window" -v -l 50% -d \
