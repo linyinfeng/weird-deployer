@@ -15,23 +15,63 @@ let
     listToAttrs
     nameValuePair
     recursiveUpdate
+    concatMapStringsSep
+    escapeShellArgs
     fold
     optional
+    attrNames
     ;
-  inherit (lib.lists) map;
+  inherit (lib.lists) map subtractLists;
   inherit (utils) escapeSystemdPath;
   cfg = config.deployer;
   monitorCfg = config.monitor;
 
-  phases = [
-    "evaluated"
-    "built"
-    "copied"
-    "system-saved"
-    "tested"
-    "profile-saved"
-    "profile-updated"
-    "deployed"
+  phaseCfgs = {
+    evaluated = {
+      requires = [ ];
+    };
+    built = {
+      requires = [ "evaluated" ];
+    };
+    copied = {
+      requires = [ "built" ];
+    };
+    system-saved = {
+      requires = [ ];
+    };
+    tested = {
+      requires = [
+        "copied"
+        "system-saved"
+      ];
+    };
+    profile-saved = {
+      requires = [ ];
+    };
+    profile-updated = {
+      requires = [
+        "tested"
+        "profile-saved"
+      ];
+    };
+    deployed = {
+      requires = [ "profile-updated" ];
+    };
+  };
+  phases = attrNames phaseCfgs;
+
+  tasks = [
+    "evaluate"
+    "build"
+    "copy"
+    "system-save"
+    "test"
+    "test-rollback"
+    "profile-save"
+    "profile-update"
+    "profile-rollback"
+    "deploy"
+    "deploy-rollback"
   ];
 
   hostOpts =
@@ -121,10 +161,8 @@ let
       "${cfg.unitPrefix}-build@${escapedName}" = recursiveUpdate serviceCommon rec {
         description = "Build %I";
         requiredBy = [ "${cfg.unitPrefix}-built.target" ];
-        requires = [
-          "${cfg.unitPrefix}-evaluate@${escapedName}.service"
-        ] ++ optional cfg.syncOn.evaluated "${cfg.unitPrefix}-evaluated.target";
-        after = requires;
+        requires = [ "${cfg.unitPrefix}-evaluate@${escapedName}.service" ];
+        after = requires ++ optional cfg.syncOn.evaluated "${cfg.unitPrefix}-evaluated.target";
         unitConfig = {
           JoinsNamespaceOf = [ "${cfg.unitPrefix}-evaluate@${escapedName}.service" ];
         };
@@ -142,10 +180,8 @@ let
       "${cfg.unitPrefix}-copy@${escapedName}" = recursiveUpdate serviceCommon rec {
         description = "Copy to %I";
         requiredBy = [ "${cfg.unitPrefix}-copied.target" ];
-        requires = [
-          "${cfg.unitPrefix}-build@${escapedName}.service"
-        ] ++ optional cfg.syncOn.built "${cfg.unitPrefix}-built.target";
-        after = requires;
+        requires = [ "${cfg.unitPrefix}-build@${escapedName}.service" ];
+        after = requires ++ optional cfg.syncOn.built "${cfg.unitPrefix}-built.target";
         unitConfig = {
           JoinsNamespaceOf = [ "${cfg.unitPrefix}-build@${escapedName}.service" ];
         };
@@ -172,14 +208,14 @@ let
       "${cfg.unitPrefix}-test@${escapedName}" = recursiveUpdate serviceCommon rec {
         description = "Test %I";
         requiredBy = [ "${cfg.unitPrefix}-tested.target" ];
-        requires =
-          [
-            "${cfg.unitPrefix}-copy@${escapedName}.service"
-            "${cfg.unitPrefix}-system-save@${escapedName}.service"
-          ]
+        requires = [
+          "${cfg.unitPrefix}-copy@${escapedName}.service"
+          "${cfg.unitPrefix}-system-save@${escapedName}.service"
+        ];
+        after =
+          requires
           ++ optional cfg.syncOn.copied "${cfg.unitPrefix}-copied.target"
           ++ optional cfg.syncOn.system-saved "${cfg.unitPrefix}-system-saved.target";
-        after = requires;
         unitConfig = {
           JoinsNamespaceOf = [ "${cfg.unitPrefix}-build@${escapedName}.service" ];
         };
@@ -227,14 +263,14 @@ let
       "${cfg.unitPrefix}-profile-update@${escapedName}" = recursiveUpdate serviceCommon rec {
         description = "Profile update %I";
         requiredBy = [ "${cfg.unitPrefix}-profile-updated.target" ];
-        requires =
-          [
-            "${cfg.unitPrefix}-test@${escapedName}.service"
-            "${cfg.unitPrefix}-profile-save@${escapedName}.service"
-          ]
+        requires = [
+          "${cfg.unitPrefix}-test@${escapedName}.service"
+          "${cfg.unitPrefix}-profile-save@${escapedName}.service"
+        ];
+        after =
+          requires
           ++ optional cfg.syncOn.tested "${cfg.unitPrefix}-tested.target"
           ++ optional cfg.syncOn.profile-saved "${cfg.unitPrefix}-profile-saved.target";
-        after = requires;
         unitConfig = {
           JoinsNamespaceOf = [ "${cfg.unitPrefix}-build@${escapedName}.service" ];
         };
@@ -271,10 +307,8 @@ let
       "${cfg.unitPrefix}-deploy@${escapedName}" = recursiveUpdate serviceCommon rec {
         description = "Deploy %I";
         requiredBy = [ "${cfg.unitPrefix}-deployed@${escapedName}.target" ];
-        requires = [
-          "${cfg.unitPrefix}-profile-update@${escapedName}.service"
-        ] ++ optional cfg.syncOn.profile-updated "${cfg.unitPrefix}-profile-updated.target";
-        after = requires;
+        requires = [ "${cfg.unitPrefix}-profile-update@${escapedName}.service" ];
+        after = requires ++ optional cfg.syncOn.profile-updated "${cfg.unitPrefix}-profile-updated.target";
         serviceConfig = {
           SyslogIdentifier = "wd-deploy-${hostCfg.name}";
         };
@@ -325,6 +359,14 @@ let
         onFailure = lib.mkIf cfg.autoRollback [ "${cfg.unitPrefix}-rollbacked@${escapedName}.target" ];
       };
     };
+
+  makePhaseTargets = unitCommon: phase: phaseCfg: {
+    "${cfg.unitPrefix}-${phase}" = {
+      description = "All Hosts ${phase}";
+      aliases = mkIf (phase == cfg.defaultPhase) [ "${cfg.unitPrefix}-default.target" ];
+      requires = map (u: "${cfg.unitPrefix}-${u}.target") phaseCfg.requires;
+    };
+  };
 in
 {
   options = {
@@ -332,7 +374,7 @@ in
       identifier = mkOption { type = types.str; };
       flake = mkOption { type = types.str; };
       hosts = mkOption { type = with types; attrsOf (submodule hostOpts); };
-      phase = mkOption {
+      defaultPhase = mkOption {
         type = types.enum phases;
         default = "deployed";
       };
@@ -388,6 +430,39 @@ in
         type = types.str;
         default = "wd-${cfg.identifier}";
       };
+
+      cli = {
+        systemctl = {
+          extraOptions = lib.mkOption {
+            type = with types; listOf str;
+            default = [
+              "--user"
+              "--show-transaction"
+            ];
+          };
+          commandShotcuts = lib.mkOption {
+            type = with types; listOf str;
+            default = [
+              "list-units"
+              "is-active"
+              "is-failed"
+              "status"
+              "show"
+              "cat"
+              "start"
+              "stop"
+              "restart"
+              "try-restart"
+              "kill"
+              "freeze"
+              "thaw"
+              "reset-failed"
+              "list-unit-files"
+              "list-jobs"
+            ];
+          };
+        };
+      };
     };
     monitor = {
       interval = mkOption {
@@ -408,17 +483,7 @@ in
         systemd.services = fold recursiveUpdate { } (mapAttrsToList (_: makeHostServices common) cfg.hosts);
         systemd.targets =
           fold recursiveUpdate { } (mapAttrsToList (_: makeHostTargets common) cfg.hosts)
-          // listToAttrs (
-            map (
-              phase:
-              nameValuePair "${cfg.unitPrefix}-${phase}" (
-                recursiveUpdate common {
-                  description = "All Hosts ${phase}";
-                  aliases = mkIf (phase == cfg.phase) [ "${cfg.unitPrefix}.target" ];
-                }
-              )
-            ) phases
-          );
+          // fold recursiveUpdate { } (mapAttrsToList (makePhaseTargets common) phaseCfgs);
         systemd.slices."${cfg.unitPrefix}" = recursiveUpdate common {
           description = "Slice deplyer ${cfg.identifier}";
         };
@@ -427,19 +492,17 @@ in
 
     (
       let
-        prepareLongOpts = "include:,exclude:";
-        prepareShortOpts = "i:,e:";
+        systemctl = "systemctl ${escapeShellArgs cfg.cli.systemctl.extraOptions}";
       in
       {
         build.deployer = pkgs.writeShellApplication {
           name = "weird-deployer";
-          runtimeInputs = (
-            with config.build;
-            [
+          runtimeInputs =
+            (with config.build; [
               prepare
               monitor
-            ]
-          );
+            ])
+            ++ (with pkgs; [ diffutils ]);
           text = ''
             args=("$@")
             action=""
@@ -451,37 +514,66 @@ in
             function wd_prepare {
               wd-prepare "$@"
             }
-            function wd_deploy_all {
-              systemctl --user start "${cfg.unitPrefix}.target" "$@"
-            }
-            function wd_deploy {
-              host="$1"
+            function wd_systemctl {
+              command="$1"
               shift
-              systemctl --user start "${cfg.unitPrefix}-deployed@$host.target" "$@"
+              systemctl_args=()
+              for arg in "$@"; do
+                case "$arg" in
+                  -*)
+                    systemctl_args+=("$arg")
+                    ;;
+                  *)
+                    systemctl_args+=("${cfg.unitPrefix}-$arg")
+                    ;;
+                esac
+              done
+              ${systemctl} "$command" "''${systemctl_args[@]}"
             }
-            function wd_rollback {
-              host="$1"
+            function wd_systemctl_task {
+              command="$1"
               shift
-              systemctl --user start "${cfg.unitPrefix}-rollbacked@$host.target" "$@"
+              task="$1"
+              shift
+              wd_systemctl_args=()
+              for arg in "$@"; do
+                case "$arg" in
+                  -*)
+                    wd_systemctl_args+=("$arg")
+                    ;;
+                  *)
+                    wd_systemctl_args+=("$task@$arg")
+                    ;;
+                esac
+              done
+              wd_systemctl "$command" "''${wd_systemctl_args[@]}"
             }
-            function wd_list_units {
-              systemctl --user list-units "${cfg.unitPrefix}*" "$@"
-            }
-            function wd_list_unit_files {
-              systemctl --user list-unit-files "${cfg.unitPrefix}*" "$@"
+            function wd_start_phase {
+              if [ "$#" -gt 1 ]; then
+                phase="$1"
+              else
+                phase="default"
+              fi
+              shift
+              wd_systemctl start "$phase.target" "$@"
             }
             function wd_stop_all {
-              systemctl --user stop "${cfg.unitPrefix}*" "$@"
+              wd_systemctl stop "*"
             }
-            function wd_reset_failed_all {
-              systemctl --user reset-failed "${cfg.unitPrefix}*" "$@"
+            function wd_deploy_all {
+              wd_systemctl start default.target
+            }
+            function wd_deploy_all_before_monitor {
+              systemctl ${
+                escapeShellArgs (subtractLists [ "--show-transaction" ] cfg.cli.systemctl.extraOptions)
+              } start "${cfg.unitPrefix}-default.target" --no-block
             }
             function wd_clean {
-              wd_stop_all
-              wd_reset_failed_all
+              wd_systemctl stop "*"
+              wd_systemctl reset-failed "*"
 
-              rm --recursive --force "${cfg.unitsDirectory}/${cfg.unitPrefix}"*
-              systemctl --user daemon-reload
+              rm --recursive --force --verbose "${cfg.unitsDirectory}/${cfg.unitPrefix}"*
+              wd_systemctl daemon-reload
             }
             function wd_monitor {
               wd-monitor "$@"
@@ -523,7 +615,7 @@ in
               if [ "$no_monitor" = "1" ]; then
                 wd_deploy_all
               else
-                wd_deploy_all --no-block
+                wd_deploy_all_before_monitor
                 WEIRD_DEPLOYER_MONITOR_SINCE="$before_start" wd_monitor
               fi
             }
@@ -533,26 +625,14 @@ in
               prepare)
                 wd_prepare "''${action_args[@]}"
                 ;;
-              deploy-all)
-                wd_deploy_all "''${action_args[@]}"
+              systemctl)
+                wd_systemctl "''${action_args[@]}"
                 ;;
-              deploy)
-                wd_deploy "''${action_args[@]}"
+              ${concatMapStringsSep "|" (c: "'${c}'") cfg.cli.systemctl.commandShotcuts})
+                wd_systemctl "$action" "''${action_args[@]}"
                 ;;
-              rollback)
-                wd_rollback "''${action_args[@]}"
-                ;;
-              status|list-units)
-                wd_list_units "''${action_args[@]}"
-                ;;
-              list-unit-files)
-                wd_list_unit_files "''${action_args[@]}"
-                ;;
-              stop-all)
-                wd_stop_all "''${action_args[@]}"
-                ;;
-              reset-failed-all)
-                wd_reset_failed_all "''${action_args[@]}"
+              ${concatMapStringsSep "|" (t: "'${t}'") tasks})
+                wd_systemctl_task start "$action" "''${action_args[@]}"
                 ;;
               clean)
                 wd_clean "''${action_args[@]}"
@@ -575,8 +655,8 @@ in
           name = "wd-prepare";
           runtimeInputs = with pkgs; [ getopt ];
           text = ''
-            LONGOPTS="${prepareLongOpts}"
-            OPTIONS="${prepareShortOpts}"
+            LONGOPTS="include:,exclude:"
+            OPTIONS="i:,e:"
 
             PARSED=$(getopt --options="$OPTIONS" --longoptions="$LONGOPTS" --name "$0" -- "$@") || exit 1
             eval set -- "$PARSED"
@@ -642,11 +722,11 @@ in
             cp --recursive --no-dereference "$units/"* "${cfg.unitsDirectory}/"
             rm --recursive "$units"
 
-            systemctl --user daemon-reload
+            ${systemctl} daemon-reload
             # stop units under new dependencies
             for unit in "''${units_changed[@]}"; do
-              if systemctl --user is-active "$unit" >/dev/null; then
-                systemctl --user stop "$unit" --show-transaction
+              if ${systemctl} is-active "$unit" >/dev/null; then
+                ${systemctl} stop "$unit"
               fi
             done
           '';
@@ -662,6 +742,15 @@ in
           text = ''
             session="${cfg.unitPrefix}"
 
+            if [ ! -v WEIRD_DEPLOYER_MONITOR_REPLACE_SESSION ] ||
+               [ "$WEIRD_DEPLOYER_MONITOR_REPLACE_SESSION" != 1 ]; then
+              if tmux has-session -t "$session" 2>/dev/null; then
+                tmux attach-session -t "$session"
+                exit
+              fi
+            fi
+
+
             if [ ! -v WEIRD_DEPLOYER_MONITOR_ATTACH_ONLY ] ||
                [ "$WEIRD_DEPLOYER_MONITOR_ATTACH_ONLY" != 1 ]; then
 
@@ -676,9 +765,7 @@ in
 
               tmux new-session -d -s "$session" \
                 'SYSTEMD_COLORS=true viddy --interval "${monitorCfg.interval}" \
-                  systemctl \
-                    --user list-units \
-                    "${cfg.unitPrefix}*"'
+                  ${systemctl} list-units "${cfg.unitPrefix}*"'
               window=0
               tmux split-window -t "$session:$window" -v -l 50% -d \
                 "journalctl --user --unit '${cfg.unitPrefix}*' \
@@ -690,7 +777,7 @@ in
                   --identifier systemd --output=cat"
               tmux split-window -t "$session:$window" -h -l 30% -d \
                 'SYSTEMD_COLORS=true viddy --interval "${monitorCfg.interval}" \
-                  systemctl --user list-jobs "${cfg.unitPrefix}*"'
+                  ${systemctl} list-jobs "${cfg.unitPrefix}*"'
               tmux rename-window -t "$session:$window" "monitor"
 
               tmux set-option -t "$session" mouse on
@@ -699,7 +786,7 @@ in
               window=1
               tmux new-window -t "$session:1" bash -c "
               for key in C-c q Escape; do
-                tmux bind-key -T root \"\$key\" kill-session -t '$session'
+                tmux bind-key -T root \"\$key\" detach-client
               done
               "
 
