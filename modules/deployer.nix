@@ -18,10 +18,14 @@ let
     concatMapStringsSep
     escapeShellArgs
     fold
-    optional
     attrNames
     ;
-  inherit (lib.lists) map subtractLists;
+  inherit (lib.lists)
+    elem
+    map
+    filter
+    subtractLists
+    ;
   inherit (utils) escapeSystemdPath;
   cfg = config.deployer;
   monitorCfg = config.monitor;
@@ -55,7 +59,10 @@ let
       ];
     };
     deployed = {
-      requires = [ "profile-updated" ];
+      requires = [
+        # "tested"
+        "profile-updated"
+      ];
     };
   };
   phases = attrNames phaseCfgs;
@@ -102,24 +109,40 @@ let
   makeHostServices =
     unitCommon: hostCfg:
     let
-      serviceCommon = unitCommon // {
-        path =
-          [ cfg.packages.nix ]
-          ++ (with pkgs; [
-            jq
-            git
-            openssh
-          ]);
-        serviceConfig = {
-          Type = "oneshot";
-          RemainAfterExit = true;
-          PrivateTmp = true;
-          WorkingDirectory = "/tmp";
-          Slice = "${cfg.unitPrefix}.slice";
-        };
-      };
+      serviceCommon =
+        { phase }:
+        lib.mkMerge [
+          unitCommon
+          {
+            path =
+              [ cfg.packages.nix ]
+              ++ (with pkgs; [
+                jq
+                git
+                openssh
+              ]);
+            serviceConfig = {
+              Type = "oneshot";
+              RemainAfterExit = true;
+              PrivateTmp = true;
+              WorkingDirectory = "/tmp";
+              Slice = "${cfg.unitPrefix}.slice";
+            };
+          }
+          (lib.mkIf (phase != null) {
+            requiredBy = [ "${cfg.unitPrefix}-${phase}.target" ];
+            after = map (u: "${cfg.unitPrefix}-${u}.target") (
+              filter (p: cfg.syncOn.${p}) phaseCfgs.${phase}.requires
+            );
+          })
+        ];
       nixCmd = "nix --extra-experimental-features 'nix-command flakes' --log-format raw --verbose";
       escapedName = escapeSystemdPath hostCfg.name;
+      taskServiceName =
+        task:
+        assert elem task tasks;
+        "${cfg.unitPrefix}-${task}@${escapedName}";
+      taskService = task: "${taskServiceName task}.service";
 
       prelude = pkgs.writeShellScript "prelude.sh" ''
         function target_command {
@@ -144,203 +167,226 @@ let
       '';
     in
     {
-      "${cfg.unitPrefix}-evaluate@${escapedName}" = recursiveUpdate serviceCommon {
-        description = "Evaluate %I";
-        requiredBy = [ "${cfg.unitPrefix}-evaluated.target" ];
-        serviceConfig = {
-          SyslogIdentifier = "wd-evaluate-${hostCfg.name}";
-        };
-        script = ''
-          ${nixCmd} path-info --derivation \
-            "${cfg.flake}#nixosConfigurations.\"${hostCfg.attribute}\".config.system.build.toplevel" \
-            >evaluate-result
-          echo "result: $(cat evaluate-result)"
-        '';
-      };
+      ${taskServiceName "evaluate"} = lib.mkMerge [
+        (serviceCommon { phase = "evaluated"; })
+        {
+          description = "Evaluate %I";
+          serviceConfig = {
+            SyslogIdentifier = "wd-evaluate-${hostCfg.name}";
+          };
+          script = ''
+            ${nixCmd} path-info --derivation \
+              "${cfg.flake}#nixosConfigurations.\"${hostCfg.attribute}\".config.system.build.toplevel" \
+              >evaluate-result
+            echo "result: $(cat evaluate-result)"
+          '';
+        }
+      ];
 
-      "${cfg.unitPrefix}-build@${escapedName}" = recursiveUpdate serviceCommon rec {
-        description = "Build %I";
-        requiredBy = [ "${cfg.unitPrefix}-built.target" ];
-        requires = [ "${cfg.unitPrefix}-evaluate@${escapedName}.service" ];
-        after = requires ++ optional cfg.syncOn.evaluated "${cfg.unitPrefix}-evaluated.target";
-        unitConfig = {
-          JoinsNamespaceOf = [ "${cfg.unitPrefix}-evaluate@${escapedName}.service" ];
-        };
-        serviceConfig = {
-          SyslogIdentifier = "wd-build-${hostCfg.name}";
-        };
-        script = ''
-          ${nixCmd} build "$(cat evaluate-result)^out" \
-            --out-link toplevel \
-            --print-build-logs
-          echo "result: $(realpath toplevel)"
-        '';
-      };
+      ${taskServiceName "build"} = lib.mkMerge [
+        (serviceCommon { phase = "built"; })
+        rec {
+          description = "Build %I";
+          requires = [ (taskService "evaluate") ];
+          after = requires;
+          unitConfig = {
+            JoinsNamespaceOf = [ (taskService "evaluate") ];
+          };
+          serviceConfig = {
+            SyslogIdentifier = "wd-build-${hostCfg.name}";
+          };
+          script = ''
+            ${nixCmd} build "$(cat evaluate-result)^out" \
+              --out-link toplevel \
+              --print-build-logs
+            echo "result: $(realpath toplevel)"
+          '';
+        }
+      ];
 
-      "${cfg.unitPrefix}-copy@${escapedName}" = recursiveUpdate serviceCommon rec {
-        description = "Copy to %I";
-        requiredBy = [ "${cfg.unitPrefix}-copied.target" ];
-        requires = [ "${cfg.unitPrefix}-build@${escapedName}.service" ];
-        after = requires ++ optional cfg.syncOn.built "${cfg.unitPrefix}-built.target";
-        unitConfig = {
-          JoinsNamespaceOf = [ "${cfg.unitPrefix}-build@${escapedName}.service" ];
-        };
-        serviceConfig = {
-          SyslogIdentifier = "wd-copy-${hostCfg.name}";
-        };
-        script = ''
-          ${nixCmd} copy --to "ssh://"${hostCfg.ssh.user}@${hostCfg.ssh.host}"" ./toplevel
-        '';
-      };
+      ${taskServiceName "copy"} = lib.mkMerge [
+        (serviceCommon { phase = "copied"; })
+        rec {
+          description = "Copy to %I";
+          requires = [ (taskService "build") ];
+          after = requires;
+          unitConfig = {
+            JoinsNamespaceOf = [ (taskService "build") ];
+          };
+          serviceConfig = {
+            SyslogIdentifier = "wd-copy-${hostCfg.name}";
+          };
+          script = ''
+            ${nixCmd} copy --to "ssh://"${hostCfg.ssh.user}@${hostCfg.ssh.host}"" ./toplevel
+          '';
+        }
+      ];
 
-      "${cfg.unitPrefix}-system-save@${escapedName}" = recursiveUpdate serviceCommon {
-        description = "System save %I";
-        requiredBy = [ "${cfg.unitPrefix}-system-saved.target" ];
-        serviceConfig = {
-          SyslogIdentifier = "wd-system-save-${hostCfg.name}";
-        };
-        script = ''
-          source "${prelude}"
-          target_command readlink /run/current-system >old-current-system
-        '';
-      };
-
-      "${cfg.unitPrefix}-test@${escapedName}" = recursiveUpdate serviceCommon rec {
-        description = "Test %I";
-        requiredBy = [ "${cfg.unitPrefix}-tested.target" ];
-        requires = [
-          "${cfg.unitPrefix}-copy@${escapedName}.service"
-          "${cfg.unitPrefix}-system-save@${escapedName}.service"
-        ];
-        after =
-          requires
-          ++ optional cfg.syncOn.copied "${cfg.unitPrefix}-copied.target"
-          ++ optional cfg.syncOn.system-saved "${cfg.unitPrefix}-system-saved.target";
-        unitConfig = {
-          JoinsNamespaceOf = [ "${cfg.unitPrefix}-build@${escapedName}.service" ];
-        };
-        serviceConfig = {
-          SyslogIdentifier = "wd-test-${hostCfg.name}";
-        };
-        script = ''
-          source "${prelude}"
-          target_switch_to_configuration "$(readlink toplevel)" test
-        '';
-      };
-
-      "${cfg.unitPrefix}-test-rollback@${escapedName}" = recursiveUpdate serviceCommon {
-        description = "System rollback %I";
-        requiredBy = [ "${cfg.unitPrefix}-rollbacked@${escapedName}.target" ];
-        conflicts = [ "${cfg.unitPrefix}-test@${escapedName}.service" ];
-        unitConfig = {
-          JoinsNamespaceOf = [ "${cfg.unitPrefix}-system-save@${escapedName}.service" ];
-        };
-        serviceConfig = {
-          SyslogIdentifier = "wd-test-rollback-${hostCfg.name}";
-        };
-        script = ''
-          if [ -f old-current-system ]; then
+      ${taskServiceName "system-save"} = lib.mkMerge [
+        (serviceCommon { phase = "system-saved"; })
+        {
+          description = "System save %I";
+          serviceConfig = {
+            SyslogIdentifier = "wd-system-save-${hostCfg.name}";
+          };
+          script = ''
             source "${prelude}"
-            target_switch_to_configuration "$(cat old-current-system)" test
-          else
-            echo "no need to rollback"
-          fi
-        '';
-      };
+            target_command readlink /run/current-system >old-current-system
+          '';
+        }
+      ];
 
-      "${cfg.unitPrefix}-profile-save@${escapedName}" = recursiveUpdate serviceCommon {
-        description = "Profile save %I";
-        requiredBy = [ "${cfg.unitPrefix}-profile-saved.target" ];
-        serviceConfig = {
-          SyslogIdentifier = "wd-profile-save-${hostCfg.name}";
-        };
-        script = ''
-          source "${prelude}"
-          target_command readlink /nix/var/nix/profiles/system >old-system-profile
-        '';
-      };
-
-      "${cfg.unitPrefix}-profile-update@${escapedName}" = recursiveUpdate serviceCommon rec {
-        description = "Profile update %I";
-        requiredBy = [ "${cfg.unitPrefix}-profile-updated.target" ];
-        requires = [
-          "${cfg.unitPrefix}-test@${escapedName}.service"
-          "${cfg.unitPrefix}-profile-save@${escapedName}.service"
-        ];
-        after =
-          requires
-          ++ optional cfg.syncOn.tested "${cfg.unitPrefix}-tested.target"
-          ++ optional cfg.syncOn.profile-saved "${cfg.unitPrefix}-profile-saved.target";
-        unitConfig = {
-          JoinsNamespaceOf = [ "${cfg.unitPrefix}-build@${escapedName}.service" ];
-        };
-        serviceConfig = {
-          SyslogIdentifier = "wd-profile-update-${hostCfg.name}";
-        };
-        script = ''
-          source "${prelude}"
-          target_command nix-env --profile /nix/var/nix/profiles/system --set "$(readlink toplevel)"
-        '';
-      };
-
-      "${cfg.unitPrefix}-profile-rollback@${escapedName}" = recursiveUpdate serviceCommon {
-        description = "Profile rollback %I";
-        requiredBy = [ "${cfg.unitPrefix}-rollbacked@${escapedName}.target" ];
-        conflicts = [ "${cfg.unitPrefix}-profile-update@${escapedName}.service" ];
-        unitConfig = {
-          JoinsNamespaceOf = [ "${cfg.unitPrefix}-profile-save@${escapedName}.service" ];
-        };
-        serviceConfig = {
-          SyslogIdentifier = "wd-profile-rollback-${hostCfg.name}";
-        };
-        script = ''
-          if [ -f old-system-profile ]; then
+      ${taskServiceName "test"} = lib.mkMerge [
+        (serviceCommon { phase = "tested"; })
+        rec {
+          description = "Test %I";
+          requires = [
+            (taskService "copy")
+            (taskService "system-save")
+          ];
+          after = requires;
+          unitConfig = {
+            JoinsNamespaceOf = [ (taskService "build") ];
+          };
+          serviceConfig = {
+            SyslogIdentifier = "wd-test-${hostCfg.name}";
+          };
+          script = ''
             source "${prelude}"
-            target_command ln --symbolic --force --no-dereference --verbose \
-              "$(cat old-system-profile)" /nix/var/nix/profiles/system
-          else
-            echo "no need to rollback"
-          fi
-        '';
-      };
+            target_switch_to_configuration "$(readlink toplevel)" test
+          '';
+        }
+      ];
 
-      "${cfg.unitPrefix}-deploy@${escapedName}" = recursiveUpdate serviceCommon rec {
-        description = "Deploy %I";
-        requiredBy = [ "${cfg.unitPrefix}-deployed@${escapedName}.target" ];
-        requires = [ "${cfg.unitPrefix}-profile-update@${escapedName}.service" ];
-        after = requires ++ optional cfg.syncOn.profile-updated "${cfg.unitPrefix}-profile-updated.target";
-        serviceConfig = {
-          SyslogIdentifier = "wd-deploy-${hostCfg.name}";
-        };
-        script = ''
-          source "${prelude}"
-          target_switch_to_configuration /run/current-system boot
-        '';
-      };
+      ${taskServiceName "test-rollback"} = lib.mkMerge [
+        (serviceCommon { phase = null; })
+        {
+          description = "System rollback %I";
+          requiredBy = [ "${cfg.unitPrefix}-rollbacked@${escapedName}.target" ];
+          conflicts = [ (taskService "test") ];
+          unitConfig = {
+            JoinsNamespaceOf = [ (taskService "system-save") ];
+          };
+          serviceConfig = {
+            SyslogIdentifier = "wd-test-rollback-${hostCfg.name}";
+          };
+          script = ''
+            if [ -f old-current-system ]; then
+              source "${prelude}"
+              target_switch_to_configuration "$(cat old-current-system)" test
+            else
+              echo "no need to rollback"
+            fi
+          '';
+        }
+      ];
 
-      "${cfg.unitPrefix}-deploy-rollback@${escapedName}" = recursiveUpdate serviceCommon rec {
-        description = "Deploy rollback %I";
-        requiredBy = [ "${cfg.unitPrefix}-rollbacked@${escapedName}.target" ];
-        requires = [
-          "${cfg.unitPrefix}-test-rollback@${escapedName}.service"
-          "${cfg.unitPrefix}-profile-rollback@${escapedName}.service"
-        ];
-        after = requires;
-        unitConfig = {
-          JoinsNamespaceOf = [ "${cfg.unitPrefix}-profile-save@${escapedName}.service" ];
-        };
-        serviceConfig = {
-          SyslogIdentifier = "wd-deploy-rollback-${hostCfg.name}";
-        };
-        script = ''
-          if [ -f old-system-profile ]; then
+      ${taskServiceName "profile-save"} = lib.mkMerge [
+        (serviceCommon { phase = "profile-saved"; })
+        {
+          description = "Profile save %I";
+          serviceConfig = {
+            SyslogIdentifier = "wd-profile-save-${hostCfg.name}";
+          };
+          script = ''
+            source "${prelude}"
+            target_command readlink /nix/var/nix/profiles/system >old-system-profile
+          '';
+        }
+      ];
+
+      ${taskServiceName "profile-update"} = lib.mkMerge [
+        (serviceCommon { phase = "profile-updated"; })
+        rec {
+          description = "Profile update %I";
+          requires = [
+            (taskService "test")
+            (taskService "profile-save")
+          ];
+          after = requires;
+          unitConfig = {
+            JoinsNamespaceOf = [ (taskService "build") ];
+          };
+          serviceConfig = {
+            SyslogIdentifier = "wd-profile-update-${hostCfg.name}";
+          };
+          script = ''
+            source "${prelude}"
+            target_command nix-env --profile /nix/var/nix/profiles/system --set "$(readlink toplevel)"
+          '';
+        }
+      ];
+
+      ${taskServiceName "profile-rollback"} = lib.mkMerge [
+        (serviceCommon { phase = null; })
+        {
+          description = "Profile rollback %I";
+          requiredBy = [ "${cfg.unitPrefix}-rollbacked@${escapedName}.target" ];
+          conflicts = [ (taskService "profile-update") ];
+          unitConfig = {
+            JoinsNamespaceOf = [ (taskService "profile-save") ];
+          };
+          serviceConfig = {
+            SyslogIdentifier = "wd-profile-rollback-${hostCfg.name}";
+          };
+          script = ''
+            if [ -f old-system-profile ]; then
+              source "${prelude}"
+              target_command ln --symbolic --force --no-dereference --verbose \
+                "$(cat old-system-profile)" /nix/var/nix/profiles/system
+            else
+              echo "no need to rollback"
+            fi
+          '';
+        }
+      ];
+
+      ${taskServiceName "deploy"} = lib.mkMerge [
+        (serviceCommon { phase = "deployed"; })
+        rec {
+          description = "Deploy %I";
+          requiredBy = [ "${cfg.unitPrefix}-deployed@${escapedName}.target" ];
+          requires = [
+            (taskService "test")
+            (taskService "profile-update")
+          ];
+          after = requires;
+          serviceConfig = {
+            SyslogIdentifier = "wd-deploy-${hostCfg.name}";
+          };
+          script = ''
             source "${prelude}"
             target_switch_to_configuration /run/current-system boot
-          else
-            echo "no need to rollback"
-          fi
-        '';
-      };
+          '';
+        }
+      ];
+
+      ${taskServiceName "deploy-rollback"} = lib.mkMerge [
+        (serviceCommon { phase = null; })
+        rec {
+          description = "Deploy rollback %I";
+          requiredBy = [ "${cfg.unitPrefix}-rollbacked@${escapedName}.target" ];
+          requires = [
+            (taskService "test-rollback")
+            (taskService "profile-rollback")
+          ];
+          after = requires;
+          unitConfig = {
+            JoinsNamespaceOf = [ (taskService "profile-save") ];
+          };
+          serviceConfig = {
+            SyslogIdentifier = "wd-deploy-rollback-${hostCfg.name}";
+          };
+          script = ''
+            if [ -f old-system-profile ]; then
+              source "${prelude}"
+              target_switch_to_configuration /run/current-system boot
+            else
+              echo "no need to rollback"
+            fi
+          '';
+        }
+      ];
     };
 
   makeHostTargets =
@@ -495,161 +541,165 @@ in
         systemctl = "systemctl ${escapeShellArgs cfg.cli.systemctl.extraOptions}";
       in
       {
-        build.deployer = pkgs.writeShellApplication {
-          name = "weird-deployer";
-          runtimeInputs =
-            (with config.build; [
-              prepare
-              monitor
-            ])
-            ++ (with pkgs; [ diffutils ]);
-          text = ''
-            args=("$@")
-            action=""
-            if [[ "$#" -ge 1 ]]; then
-              action="$1"
-              action_args=("''${args[@]:1}")
-            fi
-
-            function wd_prepare {
-              wd-prepare "$@"
-            }
-            function wd_systemctl {
-              command="$1"
-              shift
-              systemctl_args=()
-              for arg in "$@"; do
-                case "$arg" in
-                  -*)
-                    systemctl_args+=("$arg")
-                    ;;
-                  *)
-                    systemctl_args+=("${cfg.unitPrefix}-$arg")
-                    ;;
-                esac
-              done
-              ${systemctl} "$command" "''${systemctl_args[@]}"
-            }
-            function wd_systemctl_task {
-              command="$1"
-              shift
-              task="$1"
-              shift
-              wd_systemctl_args=()
-              for arg in "$@"; do
-                case "$arg" in
-                  -*)
-                    wd_systemctl_args+=("$arg")
-                    ;;
-                  *)
-                    wd_systemctl_args+=("$task@$arg")
-                    ;;
-                esac
-              done
-              wd_systemctl "$command" "''${wd_systemctl_args[@]}"
-            }
-            function wd_start_phase {
-              if [ "$#" -gt 1 ]; then
-                phase="$1"
-              else
-                phase="default"
-              fi
-              shift
-              wd_systemctl start "$phase.target" "$@"
-            }
-            function wd_stop_all {
-              wd_systemctl stop "*"
-            }
-            function wd_deploy_all {
-              wd_systemctl start default.target
-            }
-            function wd_deploy_all_before_monitor {
-              systemctl ${
-                escapeShellArgs (subtractLists [ "--show-transaction" ] cfg.cli.systemctl.extraOptions)
-              } start "${cfg.unitPrefix}-default.target" --no-block
-            }
-            function wd_clean {
-              wd_systemctl stop "*"
-              wd_systemctl reset-failed "*"
-
-              rm --recursive --force --verbose "${cfg.unitsDirectory}/${cfg.unitPrefix}"*
-              wd_systemctl daemon-reload
-            }
-            function wd_monitor {
-              wd-monitor "$@"
-            }
-            function wd {
-              no_stop=""
-              no_prepare=""
-              no_monitor=""
-              extra_args=()
-              while [ "$#" -ge 1 ]; do
-                case "$1" in
-                  --no-stop)
-                    no_stop="1"
-                    shift
-                    ;;
-                  --no-prepare)
-                    no_prepare="1"
-                    shift
-                    ;;
-                  --no-monitor)
-                    no_monitor="1"
-                    shift
-                    ;;
-                  *)
-                    extra_args+=("$1")
-                    shift
-                    ;;
-                esac
-              done
-
-              if [ "$no_prepare" != "1" ]; then
-                wd_prepare "''${extra_args[@]}"
-              fi
-              if [ "$no_stop" != "1" ]; then
-                trap wd_stop_all EXIT
+        build.deployer =
+          (pkgs.writeShellApplication {
+            name = "weird-deployer";
+            runtimeInputs =
+              (with config.build; [
+                prepare
+                monitor
+              ])
+              ++ (with pkgs; [ diffutils ]);
+            text = ''
+              args=("$@")
+              action=""
+              if [[ "$#" -ge 1 ]]; then
+                action="$1"
+                action_args=("''${args[@]:1}")
               fi
 
-              before_start="$(date --iso-8601=seconds)"
-              if [ "$no_monitor" = "1" ]; then
-                wd_deploy_all
-              else
-                wd_deploy_all_before_monitor
-                WEIRD_DEPLOYER_MONITOR_SINCE="$before_start" wd_monitor
-              fi
-            }
+              function wd_prepare {
+                wd-prepare "$@"
+              }
+              function wd_systemctl {
+                command="$1"
+                shift
+                systemctl_args=()
+                for arg in "$@"; do
+                  case "$arg" in
+                    -*)
+                      systemctl_args+=("$arg")
+                      ;;
+                    *)
+                      systemctl_args+=("${cfg.unitPrefix}-$arg")
+                      ;;
+                  esac
+                done
+                ${systemctl} "$command" "''${systemctl_args[@]}"
+              }
+              function wd_systemctl_task {
+                command="$1"
+                shift
+                task="$1"
+                shift
+                wd_systemctl_args=()
+                for arg in "$@"; do
+                  case "$arg" in
+                    -*)
+                      wd_systemctl_args+=("$arg")
+                      ;;
+                    *)
+                      wd_systemctl_args+=("$task@$arg")
+                      ;;
+                  esac
+                done
+                wd_systemctl "$command" "''${wd_systemctl_args[@]}"
+              }
+              function wd_start_phase {
+                if [ "$#" -gt 1 ]; then
+                  phase="$1"
+                else
+                  phase="default"
+                fi
+                shift
+                wd_systemctl start "$phase.target" "$@"
+              }
+              function wd_stop_all {
+                wd_systemctl stop "*"
+              }
+              function wd_deploy_all {
+                wd_systemctl start default.target
+              }
+              function wd_deploy_all_before_monitor {
+                systemctl ${
+                  escapeShellArgs (subtractLists [ "--show-transaction" ] cfg.cli.systemctl.extraOptions)
+                } start "${cfg.unitPrefix}-default.target" --no-block
+              }
+              function wd_clean {
+                wd_systemctl stop "*"
+                wd_systemctl reset-failed "*"
 
-            # parse done
-            case "$action" in
-              prepare)
-                wd_prepare "''${action_args[@]}"
-                ;;
-              systemctl)
-                wd_systemctl "''${action_args[@]}"
-                ;;
-              ${concatMapStringsSep "|" (c: "'${c}'") cfg.cli.systemctl.commandShotcuts})
-                wd_systemctl "$action" "''${action_args[@]}"
-                ;;
-              ${concatMapStringsSep "|" (t: "'${t}'") tasks})
-                wd_systemctl_task start "$action" "''${action_args[@]}"
-                ;;
-              clean)
-                wd_clean "''${action_args[@]}"
-                ;;
-              monitor)
-                wd_monitor "''${action_args[@]}"
-                ;;
-              monitor-attach)
-                WEIRD_DEPLOYER_MONITOR_ATTACH_ONLY=1 wd_monitor "''${action_args[@]}"
-                ;;
-              *)
-                # default action
-                wd "$@"
-                ;;
-            esac
-          '';
-        };
+                rm --recursive --force --verbose "${cfg.unitsDirectory}/${cfg.unitPrefix}"*
+                wd_systemctl daemon-reload
+              }
+              function wd_monitor {
+                wd-monitor "$@"
+              }
+              function wd {
+                no_stop=""
+                no_prepare=""
+                no_monitor=""
+                extra_args=()
+                while [ "$#" -ge 1 ]; do
+                  case "$1" in
+                    --no-stop)
+                      no_stop="1"
+                      shift
+                      ;;
+                    --no-prepare)
+                      no_prepare="1"
+                      shift
+                      ;;
+                    --no-monitor)
+                      no_monitor="1"
+                      shift
+                      ;;
+                    *)
+                      extra_args+=("$1")
+                      shift
+                      ;;
+                  esac
+                done
+
+                if [ "$no_prepare" != "1" ]; then
+                  wd_prepare "''${extra_args[@]}"
+                fi
+                if [ "$no_stop" != "1" ]; then
+                  trap wd_stop_all EXIT
+                fi
+
+                before_start="$(date --iso-8601=seconds)"
+                if [ "$no_monitor" = "1" ]; then
+                  wd_deploy_all
+                else
+                  wd_deploy_all_before_monitor
+                  WEIRD_DEPLOYER_MONITOR_SINCE="$before_start" wd_monitor
+                fi
+              }
+
+              # parse done
+              case "$action" in
+                prepare)
+                  wd_prepare "''${action_args[@]}"
+                  ;;
+                systemctl)
+                  wd_systemctl "''${action_args[@]}"
+                  ;;
+                ${concatMapStringsSep "|" (c: "'${c}'") cfg.cli.systemctl.commandShotcuts})
+                  wd_systemctl "$action" "''${action_args[@]}"
+                  ;;
+                ${concatMapStringsSep "|" (t: "'${t}'") tasks})
+                  wd_systemctl_task start "$action" "''${action_args[@]}"
+                  ;;
+                clean)
+                  wd_clean "''${action_args[@]}"
+                  ;;
+                monitor)
+                  wd_monitor "''${action_args[@]}"
+                  ;;
+                monitor-attach)
+                  WEIRD_DEPLOYER_MONITOR_ATTACH_ONLY=1 wd_monitor "''${action_args[@]}"
+                  ;;
+                *)
+                  # default action
+                  wd "$@"
+                  ;;
+              esac
+            '';
+          })
+          // {
+            inherit config;
+          };
 
         build.prepare = pkgs.writeShellApplication {
           name = "wd-prepare";
