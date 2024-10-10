@@ -230,6 +230,7 @@ let
             SyslogIdentifier = "wd-system-save-${hostCfg.name}";
           };
           script = ''
+            # shellcheck source=/dev/null
             source "${prelude}"
             target_command readlink /run/current-system >old-current-system
           '';
@@ -252,6 +253,7 @@ let
             SyslogIdentifier = "wd-test-${hostCfg.name}";
           };
           script = ''
+            # shellcheck source=/dev/null
             source "${prelude}"
             target_switch_to_configuration "$(readlink toplevel)" test
           '';
@@ -272,6 +274,7 @@ let
           };
           script = ''
             if [ -f old-current-system ]; then
+              # shellcheck source=/dev/null
               source "${prelude}"
               target_switch_to_configuration "$(cat old-current-system)" test
             else
@@ -289,6 +292,7 @@ let
             SyslogIdentifier = "wd-profile-save-${hostCfg.name}";
           };
           script = ''
+            # shellcheck source=/dev/null
             source "${prelude}"
             target_command readlink /nix/var/nix/profiles/system >old-system-profile
           '';
@@ -311,6 +315,7 @@ let
             SyslogIdentifier = "wd-profile-update-${hostCfg.name}";
           };
           script = ''
+            # shellcheck source=/dev/null
             source "${prelude}"
             target_command nix-env --profile /nix/var/nix/profiles/system --set "$(readlink toplevel)"
           '';
@@ -331,6 +336,7 @@ let
           };
           script = ''
             if [ -f old-system-profile ]; then
+              # shellcheck source=/dev/null
               source "${prelude}"
               target_command ln --symbolic --force --no-dereference --verbose \
                 "$(cat old-system-profile)" /nix/var/nix/profiles/system
@@ -355,6 +361,7 @@ let
             SyslogIdentifier = "wd-deploy-${hostCfg.name}";
           };
           script = ''
+            # shellcheck source=/dev/null
             source "${prelude}"
             target_switch_to_configuration /run/current-system boot
           '';
@@ -379,6 +386,7 @@ let
           };
           script = ''
             if [ -f old-system-profile ]; then
+              # shellcheck source=/dev/null
               source "${prelude}"
               target_switch_to_configuration /run/current-system boot
             else

@@ -34,6 +34,10 @@ in
       type = systemdUtils.types.slices;
       default = { };
     };
+    enableStrictShellChecks = mkOption {
+      type = lib.types.bool;
+      default = true;
+    };
 
     # required by systemd utils
     package = mkPackageOption pkgs "systemd" { };
